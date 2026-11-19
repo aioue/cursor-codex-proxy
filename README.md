@@ -35,6 +35,16 @@ Cloudflare states that Quick Tunnels "do not support Server-Sent Events (SSE)", 
 
 A quick tunnel URL changes every run. Start a fresh one for each session (Ctrl-C, run `scripts/tunnel.sh` again) and update the base URL in Cursor. An old URL then stops working, which limits how long a leaked URL is useful.
 
+## Tailscale Funnel
+
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel) is an alternative to Cloudflare. It gives a stable `https://<machine>.<tailnet>.ts.net` URL, so there is nothing to update in Cursor between sessions, and it passes SSE through.
+
+1. `npm run init`, then `npm start`.
+2. Start Tailscale. MagicDNS, HTTPS certificates and the funnel attribute for this machine must be enabled in your tailnet; if Funnel refuses to start, check the admin console.
+3. `scripts/funnel.sh`. It runs the same checks as `scripts/tunnel.sh` (key present, proxy healthy, unauthenticated request refused), prints the Cursor settings, and runs `tailscale funnel` in the foreground. Ctrl-C closes it.
+
+The proxy binds to loopback and Funnel forwards to it locally, so no proxy change is needed. The URL is public and stays the same, so the only protection is `PROXY_API_KEY`. Keep it long and private, and close the funnel when you are not using it. Funnel relays encrypted traffic and TLS ends on your own machine, so the relay servers do not see it in clear.
+
 ## Threat model
 
 Cursor calls custom models from its own servers, so the proxy has to be reachable from the internet. Through the tunnel:
@@ -42,7 +52,7 @@ Cursor calls custom models from its own servers, so the proxy has to be reachabl
 - Cursor's cloud sees every prompt, every file Cursor attaches, every response, and the proxy key. Treat it as you would sending code to any hosted model provider.
 - Anyone holding the tunnel URL and the key can spend your Codex quota. Nothing else is reachable: the key is checked on every route except `GET /healthz`, and any other path gets a 404 without the body being read.
 - The Codex access and refresh tokens never leave the machine. Cursor only ever sees `PROXY_API_KEY`.
-- Cloudflare terminates TLS and can see traffic in clear.
+- Cloudflare terminates TLS and can see traffic in clear. With Funnel, TLS ends on your machine.
 
 Local guarantees:
 
