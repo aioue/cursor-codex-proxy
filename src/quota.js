@@ -1,13 +1,12 @@
 import { MIN_QUOTA_INTERVAL_MS } from "./config.js";
 import { silentLogger } from "./log.js";
 
-// Optional quota line (5h and weekly windows). OFF unless QUOTA_LOG=1.
-// It never runs per request: observe() is a no-op until intervalMs (>= 60 s) has
-// passed since the last attempt, and the attempt timestamp is set before any
-// network call, so a burst of requests triggers at most one lookup.
-// Preferred source is the x-codex-*-used-percent headers that arrive on normal
-// responses (no extra request). Only when those are absent does it call
-// upstream.usage(), which sends the same headers as every other upstream call.
+// Quota line (5h and weekly windows). ON by default (QUOTA_LOG=0 turns it off)
+// because its normal source costs nothing: the x-codex-*-used-percent headers
+// that arrive on every response. It logs at most once per intervalMs (>= 60 s).
+// The wham/usage lookup is a separate upstream request, so it only runs when
+// QUOTA_USAGE_FETCH=1 and the headers are absent; the attempt timestamp is set
+// before any network call, so a burst of requests triggers at most one lookup.
 
 function windowLabel(minutes) {
   if (!Number.isFinite(minutes)) return "window";
@@ -56,8 +55,9 @@ export function formatQuota(windows) {
 }
 
 export class QuotaReporter {
-  constructor({ enabled = false, intervalMs = 300_000, upstream, logger = silentLogger, now = Date.now }) {
+  constructor({ enabled = false, usageFetch = false, intervalMs = 300_000, upstream, logger = silentLogger, now = Date.now }) {
     this.enabled = enabled;
+    this.usageFetch = usageFetch;
     this.intervalMs = Math.max(MIN_QUOTA_INTERVAL_MS, intervalMs);
     this.upstream = upstream;
     this.logger = logger;
@@ -77,6 +77,7 @@ export class QuotaReporter {
       this.logger.info(`quota ${formatQuota(fromHeaders)}`);
       return undefined;
     }
+    if (!this.usageFetch) return undefined;
     this.fetches += 1;
     return this.upstream.usage()
       .then((payload) => {

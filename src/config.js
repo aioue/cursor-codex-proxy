@@ -17,6 +17,22 @@ export const SERVICE_TIERS = ["priority"];
 // and the proxy simply re-reads the file instead of spending the refresh token itself.
 const DEFAULT_REFRESH_SKEW_MS = 30_000;
 const MIN_QUOTA_INTERVAL_MS = 60_000;
+// xhigh is left out of the advertised list on purpose: it burns quota fastest.
+// Opt in with CODEX_PROXY_MODEL_VARIANTS=low,medium,high,xhigh.
+const DEFAULT_VARIANTS = ["low", "medium", "high"];
+export const REFRESH_MODES = ["never", "auto"];
+
+// Where the kill switch, quota cooldown and daily counter live. Outside the
+// repo and outside CODEX_HOME, so neither git nor the CLI touches it.
+export function defaultStatePath(env = process.env) {
+  if (env.CODEX_PROXY_STATE_FILE?.trim()) return resolve(env.CODEX_PROXY_STATE_FILE.trim());
+  return join(env.HOME?.trim() || homedir(), ".cursor-codex-proxy", "state.json");
+}
+
+function flag(value, fallback) {
+  if (value === undefined || value === "") return fallback;
+  return value === "1" || value === "true";
+}
 
 function positiveInt(value, fallback, name) {
   if (value === undefined || value === "") return fallback;
@@ -96,12 +112,18 @@ export function loadConfig(env = process.env) {
   if (!REASONING_EFFORTS.includes(effort)) throw new Error(`DEFAULT_REASONING_EFFORT must be one of ${REASONING_EFFORTS.join(", ")}`);
   const tier = env.DEFAULT_SERVICE_TIER?.trim() || undefined;
   if (tier && !SERVICE_TIERS.includes(tier)) throw new Error(`DEFAULT_SERVICE_TIER must be empty or one of ${SERVICE_TIERS.join(", ")}`);
-  const refreshMode = env.CODEX_PROXY_REFRESH?.trim() || "expired";
-  if (!["expired", "never"].includes(refreshMode)) throw new Error("CODEX_PROXY_REFRESH must be expired or never");
+  // "expired" was the previous name of "auto"; accepted so old .env files keep working.
+  let refreshMode = env.CODEX_PROXY_REFRESH?.trim() || "never";
+  if (refreshMode === "expired") refreshMode = "auto";
+  if (!REFRESH_MODES.includes(refreshMode)) throw new Error("CODEX_PROXY_REFRESH must be never or auto");
 
   const originator = env.CODEX_ORIGINATOR?.trim() || "codex_cli_rs";
   const clientVersion = detectCodexVersion(env);
-  const variants = env.CODEX_PROXY_MODEL_VARIANTS === undefined ? ["low", "high", "xhigh"] : list(env.CODEX_PROXY_MODEL_VARIANTS);
+  const variants = env.CODEX_PROXY_MODEL_VARIANTS === undefined ? DEFAULT_VARIANTS : list(env.CODEX_PROXY_MODEL_VARIANTS);
+  const configuredModels = list(env.CODEX_PROXY_MODELS);
+  for (const model of configuredModels) {
+    if (!/^[A-Za-z0-9._:-]{1,64}$/.test(model)) throw new Error("CODEX_PROXY_MODELS entries must match [A-Za-z0-9._:-]{1,64}");
+  }
 
   return {
     host,
@@ -116,7 +138,7 @@ export function loadConfig(env = process.env) {
     clientVersion,
     originator,
     userAgent: env.CODEX_USER_AGENT?.trim() || defaultUserAgent(originator, clientVersion),
-    configuredModels: list(env.CODEX_PROXY_MODELS),
+    configuredModels,
     modelVariants: variants.filter((v) => REASONING_EFFORTS.includes(v) || v === "fast"),
     defaultReasoningEffort: effort,
     defaultServiceTier: tier,
@@ -124,11 +146,41 @@ export function loadConfig(env = process.env) {
     refreshSkewMs: nonNegativeInt(env.REFRESH_SKEW_MS, DEFAULT_REFRESH_SKEW_MS, "REFRESH_SKEW_MS"),
     staticAccessToken: env.CODEX_ACCESS_TOKEN?.trim() || undefined,
     staticAccountId: env.CODEX_ACCOUNT_ID?.trim() || undefined,
-    quotaLog: env.QUOTA_LOG === "1" || env.QUOTA_LOG === "true",
+    // Quota line from the x-codex-*-used-percent headers that arrive on normal
+    // responses anyway: no extra request, so on by default.
+    quotaLog: flag(env.QUOTA_LOG, true),
+    // The wham/usage lookup IS an extra request; off unless asked for.
+    quotaUsageFetch: flag(env.QUOTA_USAGE_FETCH, false),
     quotaIntervalMs: Math.max(MIN_QUOTA_INTERVAL_MS, positiveInt(env.QUOTA_LOG_INTERVAL_MS, 300_000, "QUOTA_LOG_INTERVAL_MS")),
-    maxConcurrentRequests: nonNegativeInt(env.MAX_CONCURRENT_REQUESTS, 0, "MAX_CONCURRENT_REQUESTS"),
+    // Two in flight is plenty for one person in one editor (a chat plus a
+    // background request); more mostly means a runaway agent loop.
+    maxConcurrentRequests: nonNegativeInt(env.MAX_CONCURRENT_REQUESTS, 2, "MAX_CONCURRENT_REQUESTS"),
+    maxQueueWaitMs: nonNegativeInt(env.MAX_QUEUE_WAIT_MS, 60_000, "MAX_QUEUE_WAIT_MS"),
+    // 30/min with 250 ms spacing is above what a person types and reviews, and
+    // well below what a script hammering the backend would do.
+    rateLimitPerMinute: nonNegativeInt(env.RATE_LIMIT_PER_MINUTE, 30, "RATE_LIMIT_PER_MINUTE"),
+    minRequestSpacingMs: nonNegativeInt(env.MIN_REQUEST_SPACING_MS, 250, "MIN_REQUEST_SPACING_MS"),
+    // A long, busy day of agent use; a counter well past it means something loops.
+    dailyRequestLimit: nonNegativeInt(env.DAILY_REQUEST_LIMIT, 1500, "DAILY_REQUEST_LIMIT"),
+    dailyWarnPercent: Math.min(100, positiveInt(env.DAILY_WARN_PERCENT, 80, "DAILY_WARN_PERCENT")),
+    breakerOpenAfter: positiveInt(env.BREAKER_OPEN_AFTER, 3, "BREAKER_OPEN_AFTER"),
+    breakerMaxBackoffMs: positiveInt(env.BREAKER_MAX_BACKOFF_MS, 60_000, "BREAKER_MAX_BACKOFF_MS"),
+    stateFile: defaultStatePath(env),
     maxRequestBytes: positiveInt(env.MAX_REQUEST_BYTES, 20 * 1024 * 1024, "MAX_REQUEST_BYTES"),
     requestTimeoutMs: positiveInt(env.REQUEST_TIMEOUT_MS, 15 * 60 * 1000, "REQUEST_TIMEOUT_MS"),
+    // No upstream bytes for this long ends the request. 300 s is the Codex
+    // CLI's own stream idle timeout (stream_idle_timeout_ms).
+    streamIdleTimeoutMs: positiveInt(env.STREAM_IDLE_TIMEOUT_MS, 300_000, "STREAM_IDLE_TIMEOUT_MS"),
+    // A client that stops reading gets its response destroyed after this long
+    // instead of pinning a handler (and an upstream stream) forever.
+    drainTimeoutMs: positiveInt(env.DRAIN_TIMEOUT_MS, 30_000, "DRAIN_TIMEOUT_MS"),
+    // Socket inactivity limit. Just above the stream idle timeout so a slow but
+    // live model is never cut by it; upstream events also re-arm it.
+    socketIdleTimeoutMs: positiveInt(env.SOCKET_IDLE_TIMEOUT_MS, 330_000, "SOCKET_IDLE_TIMEOUT_MS"),
+    // Streaming headers wait for the first real upstream event so an immediate
+    // failure becomes an HTTP error status, but no longer than this (tunnels
+    // drop requests that send nothing for ~100 s).
+    firstEventWaitMs: nonNegativeInt(env.FIRST_EVENT_WAIT_MS, 10_000, "FIRST_EVENT_WAIT_MS"),
     // SSE comment every 15 s while the model is thinking, so tunnels and
     // clients with idle timeouts (Cloudflare: 100 s) do not drop the stream.
     keepAliveMs: nonNegativeInt(env.SSE_KEEPALIVE_MS, 15_000, "SSE_KEEPALIVE_MS")

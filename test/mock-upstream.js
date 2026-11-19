@@ -10,7 +10,13 @@ export async function startMockUpstream(handlers = {}) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const raw = Buffer.concat(chunks).toString("utf8");
-    const record = { method: req.method, url: req.url, headers: req.headers, body: raw ? JSON.parse(raw) : undefined };
+    let body;
+    try {
+      body = raw ? JSON.parse(raw) : undefined;
+    } catch {
+      body = raw;
+    }
+    const record = { method: req.method, url: req.url, headers: req.headers, body };
     requests.push(record);
     const path = new URL(req.url, "http://x").pathname;
     const handler = handlers[path];
@@ -24,6 +30,7 @@ export async function startMockUpstream(handlers = {}) {
       return res.end(JSON.stringify({ models: [
         { slug: "gpt-live-b", priority: 1, visibility: "list" },
         { slug: "gpt-live-a", priority: 5, visibility: "list" },
+        { slug: "gpt-5.5", priority: 0, visibility: "list" },
         { slug: "gpt-hidden", visibility: "hide" }
       ] }));
     }

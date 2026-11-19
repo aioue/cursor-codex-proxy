@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { silentLogger } from "./log.js";
+import { MODEL_ID_RE, parseModelId } from "./translate.js";
 
 // Last-resort list when neither the live catalog nor the CLI's models cache is
 // available. gpt-5.5 is from the task brief; the gpt-5.6-* names are from
@@ -60,13 +61,33 @@ export class ModelCatalog {
     return { ids: BUILTIN_MODELS, source: "builtin" };
   }
 
-  async list(signal) {
-    const { ids, source } = await this.#baseIds(signal);
+  #expand(ids) {
     const all = [];
     for (const id of ids) {
       all.push(id);
       for (const variant of this.variants) all.push(`${id}-${variant}`);
     }
+    return all;
+  }
+
+  // Allowlist for /v1/chat/completions: an id this proxy advertises, or an
+  // advertised base model with suffixes that are all enabled variants (so
+  // "gpt-5.5-high-fast" needs both "high" and "fast" in
+  // CODEX_PROXY_MODEL_VARIANTS). Everything else is a local 400, nothing sent.
+  async allows(id, signal) {
+    if (typeof id !== "string" || !MODEL_ID_RE.test(id)) return false;
+    const { ids } = await this.#baseIds(signal);
+    if (this.#expand(ids).includes(id)) return true;
+    const { model, effort, serviceTier } = parseModelId(id);
+    if (!ids.includes(model)) return false;
+    if (effort && !this.variants.includes(effort)) return false;
+    if (serviceTier && !this.variants.includes("fast")) return false;
+    return true;
+  }
+
+  async list(signal) {
+    const { ids, source } = await this.#baseIds(signal);
+    const all = this.#expand(ids);
     return {
       source,
       body: {

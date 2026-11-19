@@ -1,20 +1,40 @@
-import { UpstreamError } from "./errors.js";
+import { SERVICE_TIERS } from "./config.js";
+import { HttpError, UpstreamError } from "./errors.js";
+import { UpstreamGuard } from "./guard.js";
 import { sanitize, silentLogger } from "./log.js";
+import { MODEL_ID_RE } from "./translate.js";
 
 const MODELS_TIMEOUT_MS = 5_000;
 const USAGE_TIMEOUT_MS = 5_000;
 
-async function safeErrorMessage(response) {
+const CODE_RE = /^[a-z0-9_.-]{1,64}$/i;
+
+// Message, machine code and reset hints from an upstream error body. Shapes
+// seen across the backend: {error:{type|code, message, resets_at}},
+// {detail:{code, message}}, {detail:"text"}, {code, message}.
+async function upstreamErrorInfo(response) {
   const text = await response.text().catch(() => "");
   const fallback = `Codex upstream returned HTTP ${response.status}`;
-  if (!text) return fallback;
+  if (!text) return { message: fallback };
+  let json;
   try {
-    const json = JSON.parse(text);
-    const message = json?.error?.message || json?.detail?.message || json?.detail || json?.message;
-    return sanitize(typeof message === "string" ? message : fallback, 500);
+    json = JSON.parse(text);
   } catch {
-    return sanitize(text, 300);
+    return { message: sanitize(text, 300) };
   }
+  const error = json?.error && typeof json.error === "object" ? json.error : undefined;
+  const detail = json?.detail && typeof json.detail === "object" ? json.detail : undefined;
+  const message = error?.message || detail?.message || (typeof json?.detail === "string" ? json.detail : undefined) || json?.message;
+  const code = [error?.code, error?.type, detail?.code, json?.code, typeof json?.error === "string" ? json.error : undefined]
+    .find((value) => typeof value === "string" && CODE_RE.test(value));
+  const resetsAt = Number(error?.resets_at ?? detail?.resets_at);
+  const resetsInSeconds = Number(error?.resets_in_seconds ?? detail?.resets_in_seconds);
+  return {
+    message: sanitize(typeof message === "string" ? message : fallback, 500),
+    code,
+    ...(Number.isFinite(resetsAt) ? { resetsAt } : {}),
+    ...(Number.isFinite(resetsInSeconds) ? { resetsInSeconds } : {})
+  };
 }
 
 // The fixed header set sent on EVERY upstream call (responses, models, usage, and
@@ -26,9 +46,10 @@ export function baseHeaders(config) {
 }
 
 export class CodexUpstream {
-  constructor({ config, auth, fetchImpl = globalThis.fetch, logger = silentLogger }) {
+  constructor({ config, auth, guard = new UpstreamGuard(), fetchImpl = globalThis.fetch, logger = silentLogger }) {
     this.config = config;
     this.auth = auth;
+    this.guard = guard;
     this.fetch = fetchImpl;
     this.logger = logger;
   }
@@ -38,10 +59,17 @@ export class CodexUpstream {
   }
 
   async #send(url, options, credentials) {
-    const headers = new Headers(options.headers);
-    for (const [name, value] of Object.entries(baseHeaders(this.config))) headers.set(name, value);
-    headers.set("authorization", `Bearer ${credentials.accessToken}`);
-    headers.set("chatgpt-account-id", credentials.accountId);
+    let headers;
+    try {
+      headers = new Headers(options.headers);
+      for (const [name, value] of Object.entries(baseHeaders(this.config))) headers.set(name, value);
+      headers.set("authorization", `Bearer ${credentials.accessToken}`);
+      headers.set("chatgpt-account-id", credentials.accountId);
+    } catch {
+      // Header values are validated before this point; this is the backstop so a
+      // bad value is a 400, not a misleading 500. The value is never echoed.
+      throw new HttpError(400, "A request value cannot be sent as an HTTP header.", "invalid_header_value");
+    }
     try {
       return await this.fetch(url, { ...options, headers });
     } catch (error) {
@@ -50,23 +78,38 @@ export class CodexUpstream {
     }
   }
 
-  async #request(url, options) {
+  // One upstream attempt, guarded. There are NO automatic retries for 429 or
+  // 5xx: the error goes back to Cursor (with Retry-After) and the guard holds
+  // further requests locally. The only replay is after a 401, and only when
+  // auth.json now holds a different token (the CLI refreshed meanwhile).
+  // `streaming`: success is reported by the caller when the stream completes,
+  // so an error inside a 200 stream still counts towards the breaker.
+  async #request(url, options, { streaming = false } = {}) {
+    this.guard.check();
     let credentials = await this.auth.getCredentials();
     let response = await this.#send(url, options, credentials);
     if (response.status === 401) {
       await response.body?.cancel().catch(() => {});
-      // Re-read auth.json (and refresh only if expired); never force-rotate a live token.
+      this.guard.onUnauthorized();
+      // Re-read auth.json; never refresh or force-rotate a live token.
       credentials = await this.auth.onUnauthorized(credentials.accessToken);
+      this.guard.check();
       response = await this.#send(url, options, credentials);
       if (response.status === 401) {
         await response.body?.cancel().catch(() => {});
+        this.guard.onUnauthorized();
         throw new UpstreamError(401, "ChatGPT rejected the Codex credentials. Run `codex login`, then retry.", "codex_auth_rejected");
       }
     }
     if (!response.ok) {
-      const message = await safeErrorMessage(response);
-      throw new UpstreamError(response.status, message, response.status === 429 ? "rate_limit_exceeded" : "upstream_rejected_request");
+      const info = await upstreamErrorInfo(response);
+      this.guard.observeError(response.status, info.code, { headers: response.headers, resetsAt: info.resetsAt, resetsInSeconds: info.resetsInSeconds });
+      const error = new UpstreamError(response.status, info.message, info.code ?? (response.status === 429 ? "rate_limit_exceeded" : "upstream_rejected_request"));
+      error.retryAfter = this.guard.retryAfterFor();
+      throw error;
     }
+    this.guard.onAuthOk();
+    if (!streaming) this.guard.onSuccess();
     return response;
   }
 
@@ -93,6 +136,12 @@ export class CodexUpstream {
   }
 
   async createResponse(request, signal) {
+    // Defence in depth: translate.js already validated both. Nothing from the
+    // client reaches the routing hint unless it matches the model-id pattern.
+    if (!MODEL_ID_RE.test(request.model)) throw new HttpError(400, "The model id contains unsupported characters.", "model_not_found");
+    if (request.service_tier !== undefined && !SERVICE_TIERS.includes(request.service_tier)) {
+      throw new HttpError(400, "Unsupported service tier.", "invalid_service_tier");
+    }
     const headers = {
       accept: "text/event-stream",
       "content-type": "application/json",
@@ -108,6 +157,6 @@ export class CodexUpstream {
       headers,
       body: JSON.stringify(request),
       signal
-    });
+    }, { streaming: true });
   }
 }

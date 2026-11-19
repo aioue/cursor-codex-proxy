@@ -4,61 +4,12 @@ import { writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { buildServer, createProxyServer } from "../src/server.js";
+import { createProxyServer } from "../src/server.js";
 import { QuotaReporter } from "../src/quota.js";
-import { captureLogger, jwt, sse, tempAuth } from "./helpers.js";
-import { startMockUpstream } from "./mock-upstream.js";
+import { captureLogger, jwt, sse } from "./helpers.js";
+import { KEY, SECRET_MARKER, auth, chatBody, json, startProxy } from "./harness.js";
 
-const KEY = "test-proxy-api-key-that-is-long-enough-123";
-const SECRET_MARKER = "PROMPT-CONTENT-THAT-MUST-NOT-BE-LOGGED";
-
-async function setup({ handlers, configOverrides = {}, authTokens } = {}) {
-  const upstream = await startMockUpstream(handlers);
-  const access = jwt({ exp: Math.floor(Date.now() / 1000) + 3600, "https://api.openai.com/auth": { chatgpt_account_id: "acct_test" } });
-  const { dir, authFile } = await tempAuth(authTokens ?? { access_token: access, refresh_token: "rt-fake", account_id: "acct_test" });
-  const config = {
-    host: "127.0.0.1",
-    port: 0,
-    apiKey: KEY,
-    authFile,
-    modelsCacheFile: join(dir, "models_cache.json"),
-    upstreamBaseUrl: upstream.baseUrl,
-    tokenUrl: `${upstream.origin}/oauth/token`,
-    clientVersion: "0.170.0",
-    originator: "codex_cli_rs",
-    userAgent: "codex_cli_rs/0.170.0 (Test OS 1; arm64) cursor-codex-proxy/test",
-    configuredModels: [],
-    modelVariants: ["high"],
-    defaultReasoningEffort: "medium",
-    defaultServiceTier: undefined,
-    refreshMode: "expired",
-    refreshSkewMs: 30_000,
-    quotaLog: false,
-    quotaIntervalMs: 60_000,
-    maxConcurrentRequests: 0,
-    maxRequestBytes: 1024 * 1024,
-    requestTimeoutMs: 10_000,
-    keepAliveMs: 0,
-    ...configOverrides
-  };
-  const { lines, logger } = captureLogger();
-  const server = buildServer(config, { logger });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const origin = `http://127.0.0.1:${server.address().port}`;
-  return {
-    upstream, origin, lines, dir, access,
-    close: async () => {
-      server.closeAllConnections?.();
-      server.close();
-      await upstream.close();
-    }
-  };
-}
-
-const auth = { authorization: `Bearer ${KEY}` };
-const json = { "content-type": "application/json" };
-const chatBody = (extra = {}) => JSON.stringify({ model: "gpt-5.5", messages: [{ role: "user", content: SECRET_MARKER }], ...extra });
+const setup = (options = {}) => startProxy(options);
 
 test("auth is required on every route except GET /healthz", async (t) => {
   const app = await setup();
@@ -106,7 +57,7 @@ test("/v1/models: live catalog with suffix variants, source header, no paths lea
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("x-codex-proxy-models-source"), "live");
   const body = await response.json();
-  assert.deepEqual(body.data.map((m) => m.id), ["gpt-live-a", "gpt-live-a-high", "gpt-live-b", "gpt-live-b-high"]);
+  assert.deepEqual(body.data.map((m) => m.id), ["gpt-live-a", "gpt-live-a-high", "gpt-live-b", "gpt-live-b-high", "gpt-5.5", "gpt-5.5-high"]);
   assert.match(app.upstream.requests[0].url, /models\?client_version=0\.170\.0/);
   const raw = JSON.stringify(body) + JSON.stringify([...response.headers]);
   assert.ok(!raw.includes(homedir()) && !raw.includes(app.dir));
@@ -127,7 +78,7 @@ test("/v1/models falls back to models_cache.json, then the built-in list", async
 });
 
 test("upstream fingerprint: same user-agent and originator on responses, models and usage", async (t) => {
-  const app = await setup({ configOverrides: { quotaLog: true } });
+  const app = await setup({ configOverrides: { quotaLog: true, quotaUsageFetch: true, modelVariants: ["high", "fast"] } });
   t.after(app.close);
   await fetch(`${app.origin}/v1/models`, { headers: auth });
   const r = await fetch(`${app.origin}/v1/chat/completions`, { method: "POST", headers: { ...auth, ...json }, body: chatBody({ user: "conv-1", model: "gpt-5.5-high-fast" }) });
@@ -167,11 +118,13 @@ test("non-streaming chat completion returns content and real usage", async (t) =
 test("streaming chat completion: chunks, usage chunk, [DONE]; logs hold no prompt or key", async (t) => {
   const app = await setup();
   t.after(app.close);
-  const response = await fetch(`${app.origin}/v1/chat/completions`, { method: "POST", headers: { ...auth, ...json }, body: chatBody({ stream: true }) });
+  const response = await fetch(`${app.origin}/v1/chat/completions`, { method: "POST", headers: { ...auth, ...json }, body: chatBody({ stream: true, stream_options: { include_usage: true } }) });
   assert.equal(response.status, 200);
   const text = await response.text();
   assert.match(text, /"content":"hello"/);
   assert.match(text, /"choices":\[\],"usage":\{"prompt_tokens":2/);
+  const noUsage = await (await fetch(`${app.origin}/v1/chat/completions`, { method: "POST", headers: { ...auth, ...json }, body: chatBody({ stream: true }) })).text();
+  assert.doesNotMatch(noUsage, /"usage"/, "usage chunk only with stream_options.include_usage");
   assert.match(text, /data: \[DONE\]\n\n$/);
   const log = app.lines.join("\n");
   assert.ok(!log.includes(SECRET_MARKER));
@@ -252,7 +205,7 @@ test("expired token is refreshed against the (mock) token endpoint with the same
       res.end(JSON.stringify({ access_token: newToken, refresh_token: "rt-rotated" }));
     }
   };
-  const app = await setup({ handlers, authTokens: { access_token: expiredToken, refresh_token: "rt-fake", account_id: "acct_test" } });
+  const app = await setup({ handlers, configOverrides: { refreshMode: "auto" }, authTokens: { access_token: expiredToken, refresh_token: "rt-fake", account_id: "acct_test" } });
   t.after(app.close);
   const response = await fetch(`${app.origin}/v1/chat/completions`, { method: "POST", headers: { ...auth, ...json }, body: chatBody() });
   assert.equal(response.status, 200);
@@ -263,7 +216,7 @@ test("expired token is refreshed against the (mock) token endpoint with the same
   assert.equal(responsesRequest.headers.authorization, `Bearer ${newToken}`);
 });
 
-test("quota reporter: off by default, at most one lookup per interval", async () => {
+test("quota reporter: off by default, usage fetch opt-in, at most one lookup per interval", async () => {
   let calls = 0;
   const upstream = { usage: async () => { calls += 1; return { rate_limit: { primary_window: { used_percent: 1, limit_window_seconds: 18000 } } }; } };
   const off = new QuotaReporter({ upstream });
@@ -271,7 +224,10 @@ test("quota reporter: off by default, at most one lookup per interval", async ()
   assert.equal(calls, 0);
   let clock = 0;
   const { lines, logger } = captureLogger();
-  const on = new QuotaReporter({ enabled: true, intervalMs: 1, upstream, logger, now: () => clock });
+  const headersOnly = new QuotaReporter({ enabled: true, upstream, logger, now: () => clock });
+  headersOnly.observe(new Headers());
+  assert.equal(calls, 0, "no wham/usage call unless usageFetch is enabled");
+  const on = new QuotaReporter({ enabled: true, usageFetch: true, intervalMs: 1, upstream, logger, now: () => clock });
   assert.equal(on.intervalMs, 60_000, "interval is clamped to >= 60 s");
   await on.observe(new Headers());
   for (let i = 0; i < 50; i += 1) on.observe(new Headers());
