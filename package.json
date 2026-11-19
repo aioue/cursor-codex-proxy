@@ -1,0 +1,17 @@
+{
+  "name": "cursor-codex-proxy",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Hardened single-user OpenAI-compatible proxy from Cursor to a Codex CLI ChatGPT login (fork of devteapot/codex-cursor-proxy)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "init": "node scripts/init.mjs",
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && bash -n scripts/tunnel.sh && node --test"
+  },
+  "license": "MIT"
+}
