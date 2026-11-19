@@ -9,9 +9,10 @@
   },
   "scripts": {
     "init": "node scripts/init.mjs",
+    "reset": "node scripts/reset.mjs",
     "start": "node --env-file-if-exists=.env src/server.js",
     "test": "node --test",
-    "check": "node --check src/server.js && bash -n scripts/tunnel.sh && node --test"
+    "check": "node --check src/server.js && bash -n scripts/tunnel.sh && bash -n scripts/funnel.sh && node --test"
   },
   "license": "MIT"
 }
