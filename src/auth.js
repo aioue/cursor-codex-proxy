@@ -1,13 +1,16 @@
-import { randomBytes } from "node:crypto";
-import { chmod, open, readFile, rename, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
 import { HttpError } from "./errors.js";
+import { atomicWriteJson, fileSignature } from "./fsutil.js";
 import { silentLogger } from "./log.js";
 
 // Public OAuth client id of the Codex CLI (CLIENT_ID in codex-rs/login/src/auth/manager.rs).
 const OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const REFRESH_TIMEOUT_MS = 45_000; // matches the CLI's token endpoint timeout
+// After a failed refresh, do not try again until auth.json changes on disk
+// (the user ran codex login, or the CLI refreshed) or this long has passed.
+// Each failed attempt is a request to auth.openai.com with a dead token.
+export const REFRESH_FAILURE_BACKOFF_MS = 10 * 60 * 1000;
 const LOGIN_HINT = "Run `codex login` on the machine running the proxy, then retry.";
 
 function decodeJwtPayload(token) {
@@ -63,58 +66,45 @@ async function readAuthFile(path) {
   }
 }
 
-// Write-to-temp, fsync, rename, chmod 0600, then fsync the directory. Readers
-// (including a running Codex CLI) see either the old or the new document,
-// never a truncated one. The temp name is random and opened with O_EXCL ("wx"),
-// so a pre-planted file or symlink at that name makes the write fail instead of
-// being followed.
-export async function atomicWriteJson(path, value) {
-  const directory = dirname(path);
-  const tempPath = join(directory, `.${basename(path)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
-  let handle;
-  try {
-    handle = await open(tempPath, "wx", 0o600);
-    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(tempPath, path);
-    await chmod(path, 0o600);
-  } catch (error) {
-    if (handle) await handle.close().catch(() => {});
-    await unlink(tempPath).catch(() => {});
-    throw error;
-  }
-  try {
-    const dir = await open(directory, "r");
-    await dir.sync().catch(() => {});
-    await dir.close();
-  } catch {
-    // Directory fsync is best effort (not supported everywhere).
-  }
-}
+export { atomicWriteJson };
 
-// One instance per process (buildServer creates exactly one). Refresh policy:
+class LostRace extends Error {}
+
+// One instance per process (buildServer creates exactly one).
+//
+// Default policy, CODEX_PROXY_REFRESH=never: the proxy never spends a refresh
+// token. ChatGPT refresh tokens are single use, and the Codex CLI is the only
+// process that should rotate them. The proxy re-reads auth.json on every
+// request and, once the access token is within refreshSkewMs of expiry,
+// answers 401 "run codex login" (any codex command refreshes the login).
+//
+// CODEX_PROXY_REFRESH=auto keeps the old refresh path:
 //  1. Use the access token from auth.json while it is not within refreshSkewMs of expiry.
 //  2. Near expiry, re-read auth.json first: a running Codex CLI refreshes earlier
 //     (5 min window) and the proxy then just picks up its new token.
-//  3. Only if the file still holds the stale token, and refreshMode is "expired",
-//     spend the refresh token. Concurrent callers share one in-flight refresh.
-//  4. Before writing, re-read again and compare the refresh token we used
-//     (compare-and-swap, like the CLI's persist_tokens). If another process rotated
-//     it meanwhile, its file wins and nothing is overwritten.
-//  5. Upstream 401s never force-refresh an unexpired token: they re-read the file,
-//     retry once if the token changed, and otherwise tell the user to run `codex login`.
-// The CLI serialises its own writes with flock on $CODEX_HOME/auth.lock; Node has no
-// flock, so step 4 narrows but cannot fully close the race. Hence the README advice
-// not to run the CLI and the proxy at the same time.
+//  3. Only if the file still holds the stale token, spend the refresh token.
+//     Concurrent callers share one in-flight refresh.
+//  4. Before writing, re-read and compare the refresh token we used
+//     (compare-and-swap, like the CLI's persist_tokens), then compare the file
+//     signature (mtime, size, inode) once more immediately before rename. If
+//     another writer touched the file, its version wins and a loud warning says
+//     the newly issued refresh token was not saved.
+//  5. After a failed refresh, no new attempt until auth.json changes or
+//     REFRESH_FAILURE_BACKOFF_MS passes.
+// Upstream 401s never refresh anything: they re-read the file and replay once
+// only if the token on disk changed.
+//
+// Residual race: the CLI serialises its writes with flock on $CODEX_HOME/auth.lock
+// and Node has no flock, so a CLI write landing between the last signature check
+// and rename() is still overwritten. The window is a few syscalls wide.
 export class CodexAuth {
   #inflight = null;
+  #refreshFailure = null; // { at, signature }
 
   constructor({
     authFile,
     refreshSkewMs = 30_000,
-    refreshMode = "expired",
+    refreshMode = "never",
     tokenUrl = DEFAULT_TOKEN_URL,
     clientId = OAUTH_CLIENT_ID,
     baseHeaders = {},
@@ -123,11 +113,12 @@ export class CodexAuth {
     fetchImpl = globalThis.fetch,
     now = Date.now,
     logger = silentLogger,
-    readAuth = readAuthFile // injectable for race tests
+    readAuth = readAuthFile,
+    beforeRename // test hook, passed to atomicWriteJson after the proxy's own check
   }) {
     this.authFile = authFile;
     this.refreshSkewMs = refreshSkewMs;
-    this.refreshMode = refreshMode;
+    this.refreshMode = refreshMode === "expired" ? "auto" : refreshMode;
     this.tokenUrl = tokenUrl;
     this.clientId = clientId;
     this.baseHeaders = baseHeaders;
@@ -137,6 +128,7 @@ export class CodexAuth {
     this.now = now;
     this.logger = logger;
     this.readAuth = readAuth;
+    this.beforeRenameHook = beforeRename;
   }
 
   #credentials(data) {
@@ -165,14 +157,15 @@ export class CodexAuth {
     return this.#refreshOnce();
   }
 
-  // Called after the upstream answered 401 for `usedAccessToken`.
+  // Called after the upstream answered 401 for `usedAccessToken`. Returns new
+  // credentials only when auth.json now holds a different, unexpired token
+  // (the caller may replay once); otherwise throws. Never refreshes.
   async onUnauthorized(usedAccessToken) {
     if (this.staticAccessToken) throw authError("ChatGPT rejected CODEX_ACCESS_TOKEN.", "codex_auth_rejected");
     const latest = await this.readAuth(this.authFile);
     if (latest?.tokens?.access_token !== usedAccessToken && this.#fresh(latest)) {
       return this.#credentials(latest);
     }
-    if (!this.#fresh(latest)) return this.#refreshOnce();
     throw authError("ChatGPT rejected the Codex access token.", "codex_auth_rejected");
   }
 
@@ -185,16 +178,28 @@ export class CodexAuth {
     return this.#inflight;
   }
 
+  async #recordFailure() {
+    this.#refreshFailure = { at: this.now(), signature: await fileSignature(this.authFile).catch(() => "unknown") };
+  }
+
   async #performRefresh() {
     const latest = await this.readAuth(this.authFile);
     if (this.#fresh(latest)) return this.#credentials(latest);
 
-    if (this.refreshMode === "never") {
-      throw authError("The Codex access token has expired and CODEX_PROXY_REFRESH=never. Running any `codex` command refreshes it.", "codex_auth_expired");
+    if (this.refreshMode !== "auto") {
+      throw authError("The Codex access token has expired. The proxy does not refresh logins (CODEX_PROXY_REFRESH=never); running any `codex` command refreshes it.", "codex_auth_expired");
     }
     const refreshToken = latest?.tokens?.refresh_token;
     if (typeof refreshToken !== "string" || !refreshToken) {
       throw authError("The Codex login cannot be refreshed.", "codex_refresh_missing");
+    }
+    if (this.#refreshFailure) {
+      const signature = await fileSignature(this.authFile).catch(() => "unknown");
+      const recent = this.now() - this.#refreshFailure.at < REFRESH_FAILURE_BACKOFF_MS;
+      if (recent && signature === this.#refreshFailure.signature) {
+        throw authError("The last Codex token refresh failed; the proxy will not retry until auth.json changes.", "codex_refresh_backoff");
+      }
+      this.#refreshFailure = null;
     }
 
     let response;
@@ -206,6 +211,7 @@ export class CodexAuth {
         signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS)
       });
     } catch {
+      await this.#recordFailure();
       // Transient: do not tell the user to log in again for a network blip.
       throw new HttpError(503, "Codex token refresh could not reach the authentication service.", "codex_refresh_unavailable", "upstream_error");
     }
@@ -223,6 +229,7 @@ export class CodexAuth {
       if (after && after.tokens?.refresh_token !== refreshToken && this.#fresh(after)) {
         return this.#credentials(after);
       }
+      await this.#recordFailure();
       this.logger.warn("codex token refresh failed", { status: response.status, reason: /^[a-z_]{1,64}$/.test(reason) ? reason : undefined });
       throw authError("The Codex login has expired or was revoked.", "codex_refresh_failed");
     }
@@ -234,22 +241,43 @@ export class CodexAuth {
       refreshed = null;
     }
     if (typeof refreshed?.access_token !== "string" || !refreshed.access_token) {
+      await this.#recordFailure();
       throw new HttpError(502, "The authentication service returned an invalid refresh response.", "codex_refresh_invalid", "upstream_error");
     }
+    const issuedNewRefreshToken = typeof refreshed.refresh_token === "string" && refreshed.refresh_token && refreshed.refresh_token !== refreshToken;
+    const lostRace = async () => {
+      // Never silent: the token endpoint has already rotated the refresh token,
+      // so whichever copy is not on disk is now dead.
+      this.logger.warn(issuedNewRefreshToken
+        ? "LOST AUTH RACE: auth.json changed while the proxy was saving a refreshed login. The refresh token just issued to the proxy was NOT saved and is discarded. If codex later reports refresh_token_reused, run codex login."
+        : "auth.json changed while the proxy was saving a refreshed login; keeping the other writer's file");
+      const now = await this.readAuth(this.authFile).catch(() => null);
+      if (now && this.#fresh(now)) return this.#credentials(now);
+      return this.#credentials({ tokens: { ...now?.tokens, access_token: refreshed.access_token } });
+    };
 
+    const signature = await fileSignature(this.authFile);
     const current = await this.readAuth(this.authFile);
-    if (current?.tokens?.refresh_token !== refreshToken) {
-      // Lost the race to another writer. Keep its file untouched.
-      this.logger.warn("auth.json changed during refresh; keeping the other writer's tokens");
-      if (this.#fresh(current)) return this.#credentials(current);
-      return this.#credentials({ tokens: { ...current?.tokens, access_token: refreshed.access_token } });
+    if (current?.tokens?.refresh_token !== refreshToken || (await fileSignature(this.authFile)) !== signature) {
+      return lostRace();
     }
 
     current.tokens.access_token = refreshed.access_token;
     if (typeof refreshed.id_token === "string" && refreshed.id_token) current.tokens.id_token = refreshed.id_token;
-    if (typeof refreshed.refresh_token === "string" && refreshed.refresh_token) current.tokens.refresh_token = refreshed.refresh_token;
+    if (issuedNewRefreshToken) current.tokens.refresh_token = refreshed.refresh_token;
     current.last_refresh = new Date(this.now()).toISOString();
-    await atomicWriteJson(this.authFile, current);
+    try {
+      await atomicWriteJson(this.authFile, current, {
+        beforeRename: async (tempPath) => {
+          if (this.beforeRenameHook) await this.beforeRenameHook(tempPath);
+          if ((await fileSignature(this.authFile)) !== signature) throw new LostRace();
+        }
+      });
+    } catch (error) {
+      if (error instanceof LostRace) return lostRace();
+      throw error;
+    }
+    this.#refreshFailure = null;
     this.logger.info("codex token refreshed");
     return this.#credentials(current);
   }
